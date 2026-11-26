@@ -280,4 +280,12 @@ check("mixed chain (legacy + taproot outputs) validates", ok5, reason5)
 
 print("=" * 60)
 print(f"{passed} passed, {failed} failed")
-sys.exit(1 if failed else 0)
+
+
+def test_taproot_suite():
+    """Entry point for pytest; the checks above run at import."""
+    assert failed == 0, f"{failed} taproot checks failed"
+
+
+if __name__ == "__main__":
+    sys.exit(1 if failed else 0)
