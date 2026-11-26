@@ -17,15 +17,21 @@ Model overview
 
 from __future__ import annotations
 import time
+import secrets
 from dataclasses import dataclass, field
 import hashlib
 
 from ecc import (
     gen_privkey, privkey_to_pubkey, compress, decompress,
-    pubkey_to_address, sign, verify,
+    pubkey_to_address, sign, verify, scalar_mul, G, N,
+)
+from taproot import (
+    SIGHASH_DEFAULT, address_to_output_key, bip341_sighash, is_taproot_address,
+    output_key, script_pubkey, taproot_address, taproot_sign, taproot_verify, xonly,
 )
 
 COINBASE_TXID = "0" * 64  # sentinel outpoint txid for coinbase inputs
+SEQUENCE_FINAL = 0xFFFFFFFD  # what taproot wallets use (RBF-signalling off)
 
 
 def _ser(*parts) -> bytes:
@@ -95,6 +101,41 @@ def sign_input(tx: Transaction, index: int, privkey: int) -> None:
     tx.inputs[index].signature = sign(privkey, tx.sighash()).hex()
 
 
+def script_pubkey_for(address: str) -> bytes:
+    """The scriptPubKey that pays `address`.
+
+    P2TR (bc1p...) -> OP_1 PUSH32 <output key>, exactly as on mainnet.
+    The ledger's own `1x...` addresses -> a structurally valid P2WPKH script
+    (OP_0 PUSH20 <hash>) so both live in one sighash message.
+    """
+    if is_taproot_address(address):
+        return script_pubkey(address_to_output_key(address))
+    if address.startswith("1x") and len(address) == 42:
+        return b"\x00\x14" + bytes.fromhex(address[2:])
+    raise ValueError(f"unrecognised address {address!r}")
+
+
+def bip341_sighash_for(tx: Transaction, utxo_view: dict, input_index: int) -> bytes:
+    """The real BIP341 key-path sighash for input `input_index` of `tx`.
+
+    Unlike the ledger's simplified sighash(), this commits to every spent
+    outpoint *with its amount and scriptPubKey* and to every output - the
+    BIP341 anti-fee-sniping / value-binding rules.
+    """
+    prevouts, amounts, spks, seqs = [], [], [], []
+    for inp in tx.inputs:
+        prev = utxo_view.get((inp.prev_txid, inp.prev_index))
+        if prev is None:
+            raise ValueError("input already spent or unknown (double-spend)")
+        prevouts.append((bytes.fromhex(inp.prev_txid), inp.prev_index))
+        amounts.append(prev.amount)
+        spks.append(script_pubkey_for(prev.address))
+        seqs.append(SEQUENCE_FINAL)
+    outs = [(o.amount, script_pubkey_for(o.address)) for o in tx.outputs]
+    return bip341_sighash(prevouts, amounts, spks, seqs, outs, input_index,
+                          SIGHASH_DEFAULT)
+
+
 # --------------------------- wallet ---------------------------
 
 class Wallet:
@@ -109,6 +150,27 @@ class Wallet:
 
     def __repr__(self):
         return f"Wallet({self.name}, {self.address})"
+
+
+class TaprootWallet:
+    """A BIP86-style taproot wallet: x-only key -> bc1p... key-path-only address.
+
+    The secret is the raw 32 bytes a real wallet holds; the address commits to
+    Q = P + H_TapTweak(P)*G, so spending needs the tweaked key (see taproot.py).
+    """
+
+    def __init__(self, name: str = "", seckey: bytes | None = None):
+        self.name = name
+        self.seckey = seckey or gen_privkey().to_bytes(32, "big")
+        d = int.from_bytes(self.seckey, "big")
+        if not 1 <= d <= N - 1:
+            raise ValueError("secret key out of range for secp256k1")
+        self.internal_key = xonly(scalar_mul(d, G))
+        self.output_key, self.output_is_odd = output_key(self.internal_key)
+        self.address = taproot_address(self.internal_key)
+
+    def __repr__(self):
+        return f"TaprootWallet({self.name}, {self.address})"
 
 
 # --------------------------- blocks + PoW ---------------------------
@@ -167,6 +229,9 @@ class Blockchain:
     def balance(self, address: str) -> int:
         return sum(o.amount for o in self.utxo.values() if o.address == address)
 
+    def utxos_for(self, address: str) -> dict:
+        return {k: o for k, o in self.utxo.items() if o.address == address}
+
     # ---- validation ----
     def validate_tx(self, tx: Transaction, utxo_view: dict):
         """Validate a NON-coinbase transaction against a UTXO view.
@@ -183,7 +248,7 @@ class Blockchain:
         msg = tx.sighash()
         seen = set()
         in_sum = 0
-        for inp in tx.inputs:
+        for pos, inp in enumerate(tx.inputs):
             key = (inp.prev_txid, inp.prev_index)
             if key in seen:
                 return False, 0, "duplicate input (double-spend within tx)"
@@ -192,13 +257,26 @@ class Blockchain:
                 return False, 0, "input already spent or unknown (double-spend)"
             prev = utxo_view[key]
             try:
-                pub = bytes.fromhex(inp.pubkey)
+                sig = bytes.fromhex(inp.signature)
             except ValueError:
-                return False, 0, "malformed pubkey"
-            if pubkey_to_address(pub) != prev.address:
-                return False, 0, "pubkey does not hash to the output's address"
-            if not verify(pub, msg, bytes.fromhex(inp.signature)):
-                return False, 0, "invalid signature"
+                return False, 0, "malformed signature"
+            if is_taproot_address(prev.address):
+                # Real Bitcoin path: BIP341 key-path spend of a P2TR output.
+                try:
+                    tm = bip341_sighash_for(tx, utxo_view, pos)
+                except ValueError as e:
+                    return False, 0, str(e)
+                if not taproot_verify(prev.address, tm, sig):
+                    return False, 0, "invalid taproot key-path signature"
+            else:
+                try:
+                    pub = bytes.fromhex(inp.pubkey)
+                except ValueError:
+                    return False, 0, "malformed pubkey"
+                if pubkey_to_address(pub) != prev.address:
+                    return False, 0, "pubkey does not hash to the output's address"
+                if not verify(pub, msg, sig):
+                    return False, 0, "invalid signature"
             in_sum += prev.amount
 
         if any(o.amount <= 0 for o in tx.outputs):
@@ -281,6 +359,32 @@ class Blockchain:
 
             prev_hash = block.hash()
         return True, "chain valid"
+
+
+def build_taproot_spend(bc: Blockchain, sender: "TaprootWallet", sends: list, fee: int = 0):
+    """Same as build_spend, but signs with BIP341 key-path signatures."""
+    need = sum(a for _, a in sends) + fee
+    gathered, chosen = 0, []
+    for (txid, idx), out in bc.utxo.items():
+        if out.address == sender.address:
+            chosen.append((txid, idx, out))
+            gathered += out.amount
+            if gathered >= need:
+                break
+    if gathered < need:
+        raise ValueError(f"insufficient funds: have {gathered}, need {need}")
+
+    inputs = [TxInput(txid, idx) for txid, idx, _ in chosen]
+    outputs = [TxOutput(amt, addr) for addr, amt in sends]
+    change = gathered - need
+    if change > 0:
+        outputs.append(TxOutput(change, sender.address))
+
+    tx = Transaction(inputs, outputs)
+    for i in range(len(inputs)):            # BIP341 sighash depends on input index
+        tm = bip341_sighash_for(tx, bc.utxo, i)
+        tx.inputs[i].signature = taproot_sign(sender.seckey, tm).hex()
+    return tx
 
 
 def build_spend(bc: Blockchain, sender: Wallet, sends: list, fee: int = 0):

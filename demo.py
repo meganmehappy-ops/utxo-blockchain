@@ -9,6 +9,7 @@ Story:
   3. A miner seals that block; balances update.
   4. Alice tries to double-spend a UTXO she already spent -> REJECTED.
   5. The whole chain is re-validated from genesis.
+  6. A taproot (BIP341) wallet receives coins and spends them key-path only.
 
 Note: private keys, addresses and block hashes are random per run, so the exact
 hex strings below will differ each time you execute it.
@@ -17,7 +18,10 @@ hex strings below will differ each time you execute it.
 from __future__ import annotations
 import argparse
 
-from utxo import Blockchain, Wallet, build_spend, TxInput, TxOutput, Transaction, sign_input
+from utxo import (
+    Blockchain, Wallet, TaprootWallet, build_spend, build_taproot_spend,
+    TxInput, TxOutput, Transaction, sign_input,
+)
 
 
 def line(c="-", n=64):
@@ -77,9 +81,22 @@ def main():
     print(f"    validate_chain() -> {ok}  ({reason})")
     print(f"    chain length = {len(bc.chain)} blocks, UTXO set = {len(bc.utxo)} outputs")
 
+    # --- 6. a real taproot (bc1p...) wallet on the same chain ---
+    print("\n[6] Taproot: Dave gets a bc1p... coinbase and spends it key-path only")
+    dave, erin = TaprootWallet("Dave"), TaprootWallet("Erin")
+    print(f"    Dave     {dave.address}  (P2TR, BIP350 bech32m)")
+    bt = bc.add_block([], dave.address)
+    print(f"    block #{bt.index}  hash {bt.hash()[:20]}...  nonce {bt.nonce}")
+    ttx = build_taproot_spend(bc, dave, [(erin.address, 10)], fee=1)
+    print(f"    Dave -> Erin 10 (fee 1); input carries no pubkey, only a BIP340 sig")
+    bc.add_block([ttx], miner.address)
+    print(f"    Dave balance = {bc.balance(dave.address)}, "
+          f"Erin balance = {bc.balance(erin.address)}")
+    print(f"    validate_chain() -> {bc.validate_chain()[0]}")
+
     line("=")
     total = sum(o.amount for o in bc.utxo.values())
-    print(f" Total coins in existence: {total}  (2 coinbases x 50 + fees)")
+    print(f" Total coins in existence: {total}  (coinbases + fees)")
     line("=")
 
 
