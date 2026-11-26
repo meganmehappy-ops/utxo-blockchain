@@ -1,0 +1,42 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: pytest (${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # No third-party runtime deps; pytest only to drive the suites.
+      - name: Install pytest
+        run: python -m pip install --upgrade pip pytest
+
+      # test_taproot.py checks the BIP340/341/350 vectors on import and
+      # exposes a single test_* entry point; test_utxo.py is a plain suite.
+      - name: Run the ledger and taproot suites
+        run: python -m pytest -v test_utxo.py test_taproot.py
+
+      # Same suites as the README tells you to run locally, so the script
+      # entry points stay working.
+      - name: Run the scripts directly
+        run: |
+          python test_utxo.py
+          python test_taproot.py
+
+      - name: Run the demo
+        run: python demo.py

@@ -145,6 +145,16 @@ python test_taproot.py
 68 passed, 0 failed
 ```
 
+Both suites are also pytest-compatible:
+
+```bash
+python -m pytest test_utxo.py test_taproot.py
+```
+
+## Continuous integration
+
+`.github/workflows/tests.yml` runs on every push to `main` and every pull request: Python 3.10 and 3.13, `pytest` over both suites, then each suite through its own script entry point, then `demo.py`.
+
 ## Project structure
 
 ```
@@ -156,6 +166,7 @@ utxo-blockchain/
 |-- test_utxo.py    # 27 correctness checks (crypto + ledger)
 |-- test_taproot.py # 68 checks incl. the official BIP340/341/350 vectors
 |-- vectors/        # downloaded BIP340 + BIP341 test vectors
+|-- .github/workflows/tests.yml  # CI: pytest + both suites as scripts + demo
 |-- README.md
 |-- LICENSE
 `-- .gitignore
